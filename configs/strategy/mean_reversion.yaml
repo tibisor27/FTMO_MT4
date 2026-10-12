@@ -1,0 +1,7 @@
+name: "mean_reversion"
+friday_cutoff_hour: 15
+rsi_period: 14
+bb_period: 20
+bb_std: 2.0
+rsi_oversold: 35
+rsi_overbought: 65

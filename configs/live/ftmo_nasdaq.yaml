@@ -1,0 +1,44 @@
+# Live configuration. Every value marked VERIFICA must be read from the terminal before going live:
+# Market Watch (Ctrl+M) -> right click the symbol -> Specification.
+symbol: "US100.cash"          # VERIFICA - FTMO nu publica numele simbolului
+magic: 20260913
+
+session:
+  tz: "America/New_York"
+  rth_start: "09:30"
+  rth_end: "16:00"
+  decision_minutes: [0, 30]
+  first_decision: "10:00"
+  last_decision: "13:30"      # citirea prudenta a regulii de gap trading; Sharpe 1.06 in loc de 1.30
+  eod_flatten: "15:57"
+  act_offset_min: 1           # actionezi la HH:01, pe bara HH:00 tocmai incheiata
+
+strategy:                     # trebuie sa fie IDENTICE cu configs/backtest/noise_area.yaml
+  lookback: 14
+  vm: 1.5
+  exit_rule: "opposite_band"
+  warmup_days: 25
+
+risk:
+  strategy_daily_vol: 0.00625 # volatilitatea zilnica a strategiei la 1x, din backtest
+  target_daily_vol: 0.0075
+  contract_size: 2.0          # VERIFICA - valoarea unui punct de indice
+  lot_step: 0.01              # VERIFICA
+  min_lot: 0.01               # VERIFICA
+
+guards:
+  max_daily_loss_pct: 0.03    # limita FTMO e 5% - stam sub ea
+  max_total_loss_pct: 0.07    # limita FTMO e 10%
+  max_orders_per_day: 20
+  max_lots: 3.0
+  halt_file: "HALT"
+
+news:
+  events_csv: "configs/live/restricted_events.csv"
+  blackout_minutes: 5         # regula e +/-2; marja e deliberata
+
+paths:
+  state: "state/live_state.json"
+  fills: "state/live_fills.csv"
+  decisions: "state/live_decisions.csv"
+  log: "state/live.log"

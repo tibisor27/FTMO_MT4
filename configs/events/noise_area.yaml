@@ -1,0 +1,9 @@
+# Noise Area intraday momentum (Zarattini, Aziz, Barbon) — entries only
+name: "noise_area"
+lookback: 14            # days used for the average open->time move
+vm: 1.0                 # volatility multiplier (paper: 1; optimum on SPY ~1.3-1.5)
+decision_minutes: [0, 30]
+first_decision: "10:00"
+tz: "America/New_York"
+rth_start: "09:30"
+rth_end: "16:00"
