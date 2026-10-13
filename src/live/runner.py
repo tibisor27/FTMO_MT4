@@ -24,9 +24,10 @@ import pandas as pd
 import yaml
 
 from src.events.noise_area import _bands
-from src.live.broker import Broker, Position
+from src.live.broker import Broker, OrderRejected, Position
 from src.live.clock import Blackout, SessionClock
 from src.live.guards import Guards, size_lots
+from src.live.sizing import SizingPolicy, trading_days_left
 from src.live.state import LiveState
 
 log = logging.getLogger("live.runner")
@@ -118,20 +119,134 @@ class Runner:
                              max_orders_per_day=int(g["max_orders_per_day"]),
                              max_lots=float(g["max_lots"]),
                              halt_file=str(self.root / g["halt_file"]))
+        self.guards.max_notional_mult = float(g.get("max_notional_mult", 5.0))
         self.state = LiveState.load(self.root / cfg["paths"]["state"])
         self.state.path = str(self.root / cfg["paths"]["state"])
         self.symbol = cfg["symbol"]
 
+        # cate treziri la rand fara terminal inainte sa consideram ca e o cadere reala
+        self.max_conn_fails = int(cfg.get("session", {}).get("max_conn_fails", 6))
+        self.conn_fails = 0
+
+        # politica de marime
+        sz = cfg.get("sizing", {}) or {}
+        self.sizing_mode = str(sz.get("mode", "fixed")).lower()
+        self.policy: SizingPolicy | None = None
+        self.horizon_days = int(sz.get("horizon_days", 126))
+        self.phase_targets = {1: float(sz.get("phase1_target_pct", 0.10)),
+                              2: float(sz.get("phase2_target_pct", 0.05))}
+        if self.sizing_mode == "policy":
+            self.policy = SizingPolicy.from_csv(self.root / sz["policy_csv"])
+            if self.horizon_days > self.policy.horizon:
+                raise ValueError(f"orizontul din config ({self.horizon_days}) depaseste "
+                                 f"tabelul ({self.policy.horizon} zile)")
+            if self.state.phase not in self.policy.table:
+                self.state.phase = int(sz.get("phase", 1))
+        self.spec = None
+
+    # ---------------- verificarea de dinainte de prima bara ----------------
+    def preflight(self) -> None:
+        """
+        Confrunta fisierul de configurare cu ce spune TERMINALUL. Se cheama o data, la pornire,
+        inainte de orice ordin. Daca marimea contractului difera, nu pornim: nicio garda de mai
+        jos nu poate prinde un multiplicator gresit, pentru ca ea vede acelasi numar gresit.
+        """
+        self.spec = self.broker.symbol_spec(self.symbol)
+        r = self.cfg["risk"]
+        bad = []
+        for key, real in (("contract_size", self.spec.contract_size),
+                          ("lot_step", self.spec.lot_step),
+                          ("min_lot", self.spec.min_lot)):
+            want = float(r[key])
+            if abs(want - real) > 1e-9:
+                bad.append(f"{key}: config {want} vs terminal {real}")
+        if bad:
+            raise RuntimeError("specificatia simbolului nu se potriveste cu configurarea:\n  "
+                               + "\n  ".join(bad)
+                               + "\nCorecteaza configs/live/*.yaml dupa terminal, nu invers.")
+        self._check_state_matches_account()
+        log.info("preflight OK: %s contract_size=%s lot_step=%s min_lot=%s",
+                 self.symbol, self.spec.contract_size, self.spec.lot_step, self.spec.min_lot)
+
+    def _check_state_matches_account(self, tol: float = 0.30) -> None:
+        """
+        Starea salvata descrie un PROGRAM, nu un cont oarecare: `initial_balance` si
+        `phase_start_balance` sunt reperele fata de care se masoara si pierderea totala, si
+        pozitia in tabelul de marime. Daca pornesti pe un cont de alta marime fara sa stergi
+        fisierul de stare, amandoua raman la valorile vechi - garda te-ar opri instantaneu cu
+        "pierdere totala 80%", iar politica ar citi din coltul in care renunta. Esec tacut si
+        foarte derutant, deci il facem zgomotos.
+        """
+        bal = float(self.broker.balance())
+        if bal <= 0:
+            return
+        for name, ref in (("initial_balance", self.state.initial_balance),
+                          ("phase_start_balance", self.state.phase_start_balance)):
+            if ref and abs(bal - ref) / ref > tol:
+                raise RuntimeError(
+                    f"starea salvata nu se potriveste cu contul: {name}={ref:,.2f} dar contul "
+                    f"are balanta {bal:,.2f} ({abs(bal-ref)/ref:.0%} diferenta).\n"
+                    f"Daca ai schimbat contul, goleste {self.state.path} si reporneste "
+                    f"(programul incepe de la zero: zile ramase, faza, repere)."
+                )
+
+    # ---------------- cat de mare tranzactionam azi ----------------
+    def vol_target(self, equity: float, now: pd.Timestamp) -> tuple[float, dict]:
+        """Tinta de volatilitate zilnica (fractie, nu procente) plus contextul, pentru jurnal."""
+        if self.sizing_mode != "policy" or self.policy is None:
+            return float(self.cfg["risk"]["target_daily_vol"]), {"mode": "fixed"}
+        today = str(self.clock.local(now).date())
+        if not self.state.program_start:
+            self.state.start_program(today, self.broker.balance())
+        base = self.state.phase_start_balance or self.broker.balance()
+        eq_rel = (equity / base - 1.0) if base > 0 else 0.0
+        days = trading_days_left(self.state.program_start, today, self.horizon_days)
+        pct = self.policy.vol_target_pct(self.state.phase, days, eq_rel)
+        return pct / 100.0, {"mode": "policy", "phase": self.state.phase,
+                             "days_left": days, "eq_rel": eq_rel, "vol_pct": pct}
+
+    def _maybe_advance_phase(self, equity: float) -> None:
+        base = self.state.phase_start_balance
+        tgt = self.phase_targets.get(self.state.phase)
+        if self.policy is None or not base or tgt is None:
+            return
+        if self.state.phase + 1 in self.policy.table and equity >= base * (1.0 + tgt):
+            self.state.advance_phase(equity)
+            self.state.save()
+
+    def _adopt_orders_today(self) -> None:
+        """Reconstruieste contorul de ordine din jurnalul de executii: o repornire nu are voie
+        sa-l piarda, altfel plafonul zilnic numara in minus."""
+        p = self.root / self.cfg["paths"]["fills"]
+        if not p.exists() or p.stat().st_size == 0:
+            return
+        try:
+            d = pd.read_csv(p)
+            if d.empty or "ts" not in d.columns:
+                return
+            ts = pd.to_datetime(d["ts"], utc=True, errors="coerce")
+            day = pd.Series(self.clock.local(t).date() if pd.notna(t) else None for t in ts)
+            n = int((day.astype(str) == self.state.trade_date).sum())
+            if n > self.state.orders_today:
+                log.info("contorul de ordine refacut din jurnal: %d (era %d)",
+                         n, self.state.orders_today)
+                self.state.orders_today = n
+        except Exception:                                   # pragma: no cover
+            log.exception("nu pot reface contorul de ordine din %s", p)
+
     # ---------------- logging of intent, not just of orders ----------------
-    def _record(self, d: Decision, lots: float, note: str) -> None:
+    def _record(self, d: Decision, lots: float, note: str, ctx: dict | None = None) -> None:
+        ctx = ctx or {}
         p = self.root / self.cfg["paths"]["decisions"]
         p.parent.mkdir(parents=True, exist_ok=True)
         new = (not p.exists()) or p.stat().st_size == 0   # an existing but EMPTY file still needs a header
         with p.open("a", encoding="utf-8") as f:
             if new:
-                f.write("bar,close,ub,lb,current,target,lots,reason,note\n")
-            f.write(f"{d.bar},{d.close},{d.ub},{d.lb},{d.current},{d.target},"
-                    f"{lots},{d.reason},{note}\n")
+                f.write("bar,close,ub,lb,current,target,lots,vol_target_pct,phase,"
+                        "days_left,eq_rel,reason,note\n")
+            f.write(f"{d.bar},{d.close},{d.ub},{d.lb},{d.current},{d.target},{lots},"
+                    f"{ctx.get('vol_pct','')},{ctx.get('phase','')},{ctx.get('days_left','')},"
+                    f"{ctx.get('eq_rel','')},{d.reason},{note}\n")
 
     def _record_fill(self, fill) -> None:
         p = self.root / self.cfg["paths"]["fills"]
@@ -160,20 +275,48 @@ class Runner:
         if now.tz is None:
             now = now.tz_localize("UTC")
 
+        # ---- 1. legatura. O cadere scurta NU e motiv de oprire a zilei. ----
         if not self.broker.is_connected():
-            self.state.halt("terminalul nu e conectat")
-            return "deconectat"
+            self.conn_fails += 1
+            if self.conn_fails < self.max_conn_fails:
+                log.warning("terminalul nu raspunde (%d/%d) - reincerc",
+                            self.conn_fails, self.max_conn_fails)
+                return f"deconectat ({self.conn_fails}/{self.max_conn_fails})"
+            try:                                   # cadere sustinuta: INCHIDEM, apoi oprim
+                if not self.broker.position(self.symbol).flat:
+                    self._flatten("deconectare sustinuta")
+            except Exception:                      # pragma: no cover
+                log.exception("NU am putut inchide pozitia la deconectare - ramane deschisa, "
+                              "verifica manual terminalul")
+            self.state.halt(f"terminalul nu e conectat ({self.conn_fails} incercari)")
+            return "oprit: deconectat"
+        self.conn_fails = 0
 
         equity = self.broker.equity()
         local_date = str(self.clock.local(now).date())
         if self.state.roll_day(local_date, equity):
+            self._adopt_orders_today()
             self.state.save()
+
+        # ---- 2. pozitia reala, INAINTE de orice ramura care poate iesi din functie ----
+        pos = self._sync()
+
+        # ---- 3. inchiderea de final. Necondiționata: nici oprirea de ieri, nici o fereastra
+        #         de stiri nu au voie sa lase o pozitie deschisa peste noapte. ----
+        if self.clock.is_flatten_time(now):
+            if not pos.flat:
+                b = self.blackout.blocked(now)
+                if b:
+                    log.error("inchid la final DESI suntem in fereastra restrictionata (%s); "
+                              "o pozitie peste noapte ar fi mai rea - noteaza incidentul", b)
+                self._flatten("sfarsit de sesiune")
+                return "flatten EOD"
+            return "flat, sfarsit de sesiune"
 
         if self.state.halted:
             return f"oprit: {self.state.halt_reason}"
 
-        pos = self._sync()
-
+        # ---- 4. garzile ----
         reason = self.guards.check(equity=equity, day_start_equity=self.state.day_start_equity,
                                    initial_balance=self.state.initial_balance,
                                    orders_today=self.state.orders_today)
@@ -183,17 +326,13 @@ class Runner:
             self.state.halt(reason)
             return f"oprit: {reason}"
 
+        # ---- 5. blackout: blocheaza actiuni NOI, nu inchiderea de final (deja trecuta) ----
         blocked = self.blackout.blocked(now)
         if blocked:
             self.state.save()
             return f"blackout: {blocked}"
 
-        if self.clock.is_flatten_time(now):
-            if not pos.flat:
-                self._flatten("sfarsit de sesiune")
-                return "flatten EOD"
-            return "flat, sfarsit de sesiune"
-
+        self._maybe_advance_phase(equity)
         bar = self.clock.decision_bar(now)
         if bar is None:
             return "nu e moment de decizie"
@@ -211,32 +350,54 @@ class Runner:
 
         note = ""
         lots = 0.0
+        tvol, ctx = self.vol_target(equity, now)
         if d.target != d.current:
             if d.target == 0:
                 self._flatten(d.reason)
                 note = "inchis"
             else:
                 r = self.cfg["risk"]
-                lots = self.guards.clamp_lots(size_lots(
-                    equity=equity, price=d.close, contract_size=float(r["contract_size"]),
+                spec = self.spec
+                lots = size_lots(
+                    equity=equity, price=d.close,
+                    contract_size=float(spec.contract_size if spec else r["contract_size"]),
                     strategy_daily_vol=float(r["strategy_daily_vol"]),
-                    target_daily_vol=float(r["target_daily_vol"]),
-                    lot_step=float(r["lot_step"]), min_lot=float(r["min_lot"]),
-                    max_lots=float(self.guards.max_lots)))
+                    target_daily_vol=tvol,
+                    lot_step=float(spec.lot_step if spec else r["lot_step"]),
+                    min_lot=float(spec.min_lot if spec else r["min_lot"]),
+                    max_lots=float(self.guards.max_lots),
+                    max_notional_mult=float(self.guards.max_notional_mult))
                 if lots <= 0:
                     note = "marime 0 dupa rotunjire - nu trimit nimic"
-                    log.warning("%s (echitate %.0f, pret %.1f)", note, equity, d.close)
+                    log.warning("%s (echitate %.0f, pret %.1f, tinta %.3f%%/zi)",
+                                note, equity, d.close, tvol * 100)
                 else:
-                    fill = self.broker.market_order(self.symbol, d.target, lots, d.reason)
+                    try:
+                        fill = self.broker.market_order(self.symbol, d.target, lots, d.reason)
+                    except OrderRejected as e:
+                        # O bara ratata nu e o zi pierduta. Fatal = oprim, altfel mergem mai departe.
+                        note = f"ordin respins: {e}"
+                        log.error("%s", note)
+                        if e.fatal:
+                            self.state.halt(f"ordin respins fatal: {e}")
+                        self.state.mark(bar_utc)
+                        self.state.save()
+                        self._record(d, 0.0, note, ctx)
+                        return note
                     self._record_fill(fill)
                     self.state.orders_today += 1
-                    self.state.believed_side, self.state.believed_lots = d.target, lots
-                    note = f"ordin {d.target:+d} {lots}"
-                    log.info("%s @ %.2f (%s)", note, fill.price, d.reason)
+                    # marimea CREZUTA vine din executie, nu din cerere
+                    self.state.believed_side = d.target if fill.lots > 0 else 0
+                    self.state.believed_lots = float(fill.lots)
+                    note = f"ordin {d.target:+d} {fill.lots}"
+                    if fill.partial:
+                        note += f" (PARTIAL din {fill.requested})"
+                    log.info("%s @ %.2f (%s) tinta %.2f%%/zi", note, fill.price, d.reason,
+                             tvol * 100)
 
         self.state.mark(bar_utc)
         self.state.save()
-        self._record(d, lots, note)
+        self._record(d, lots, note, ctx)
         return f"{d.reason} -> {d.target:+d} {note}".strip()
 
 

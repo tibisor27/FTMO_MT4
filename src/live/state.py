@@ -19,6 +19,11 @@ log = logging.getLogger("live.state")
 
 @dataclass
 class LiveState:
+    # ---- programul (nu se reseteaza niciodata la schimbarea zilei) ----
+    program_start: str = ""          # prima zi a incercarii curente, ISO
+    phase: int = 1                   # 1 = evaluare, 2 = verificare
+    phase_start_balance: float = 0.0 # balanta de la care se masoara echitatea relativa
+    # ---- ziua ----
     trade_date: str = ""
     processed_bars: list[str] = field(default_factory=list)
     believed_side: int = 0
@@ -35,6 +40,7 @@ class LiveState:
     def load(cls, path: str | Path) -> "LiveState":
         p = Path(path)
         if not p.exists():
+            log.info("stare noua la %s", p)
             return cls(path=str(p))
         try:
             raw = json.loads(p.read_text(encoding="utf-8"))
@@ -75,6 +81,20 @@ class LiveState:
         s = str(pd.Timestamp(bar_ts))
         if s not in self.processed_bars:
             self.processed_bars.append(s)
+
+    def start_program(self, date: str, balance: float) -> None:
+        """Prima pornire, sau o incercare noua dupa ce contul precedent a fost pierdut."""
+        log.info("program nou: start %s, balanta de referinta %.2f, faza %d",
+                 date, balance, self.phase)
+        self.program_start = date
+        self.phase_start_balance = balance
+
+    def advance_phase(self, balance: float) -> None:
+        """Evaluarea trecuta: faza 2, si balanta de referinta se reseteaza (asa face si firma)."""
+        log.warning("FAZA %d -> %d, balanta de referinta devine %.2f",
+                    self.phase, self.phase + 1, balance)
+        self.phase += 1
+        self.phase_start_balance = balance
 
     def adopt(self, side: int, lots: float) -> None:
         """Trust the broker over our own memory."""

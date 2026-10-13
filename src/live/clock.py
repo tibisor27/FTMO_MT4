@@ -59,6 +59,12 @@ class SessionClock:
         If `ts` is an acting moment, return the timestamp of the decision BAR it acts on.
 
         Acting at 10:01:xx acts on the bar stamped 10:00. Returns None at any other minute.
+
+        Plafonul de sus e `eod_flatten`, NU `last_decision`. Dupa `last_decision` botul
+        trebuie sa poata in continuare sa IASA dintr-o pozitie - doar sa nu mai deschida.
+        Cine decide asta e `entries_allowed()`, pe care `decide()` il primeste ca parametru.
+        Daca plafonul ar sta aici, `decide()` nu s-ar mai apela deloc si stopul de banda
+        nu s-ar putea declansa intre 13:31 si inchiderea fortata.
         """
         t = self.local(ts)
         if t.dayofweek >= 5:
@@ -70,7 +76,9 @@ class SessionClock:
         if bar.minute not in self.decision_minutes:
             return None
         m = bar.hour * 60 + bar.minute
-        if m < _hm(self.first_decision) or m > _hm(self.last_decision):
+        if m < _hm(self.first_decision):
+            return None
+        if m >= _hm(self.eod_flatten):          # dupa asta inchide oricum tot
             return None
         if not (_hm(self.rth_start) <= m < _hm(self.rth_end)):
             return None

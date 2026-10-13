@@ -1,5 +1,8 @@
 # Live configuration. Every value marked VERIFICA must be read from the terminal before going live:
 # Market Watch (Ctrl+M) -> right click the symbol -> Specification.
+#
+# De la 2026-10-12, `contract_size`, `lot_step` si `min_lot` sunt CONFRUNTATE automat cu
+# symbol_info() la pornire (Runner.preflight). Daca difera, botul nu porneste.
 symbol: "US100.cash"          # VERIFICA - FTMO nu publica numele simbolului
 magic: 20260913
 
@@ -9,28 +12,45 @@ session:
   rth_end: "16:00"
   decision_minutes: [0, 30]
   first_decision: "10:00"
-  last_decision: "13:30"      # citirea prudenta a regulii de gap trading; Sharpe 1.06 in loc de 1.30
+  last_decision: "13:30"      # plafon pentru INTRARI; iesirile se evalueaza pana la eod_flatten
   eod_flatten: "15:57"
   act_offset_min: 1           # actionezi la HH:01, pe bara HH:00 tocmai incheiata
+  max_conn_fails: 6           # treziri la rand fara terminal (6 x 5s = 30s) inainte de oprire
 
-strategy:                     # trebuie sa fie IDENTICE cu configs/backtest/noise_area.yaml
+strategy:                     # IDENTICE cu configs/events/noise_area.yaml
   lookback: 14
-  vm: 1.5
+  vm: 1.0                     # era 1.5; cercetarea, HJB-ul si politica de marime sunt toate pe 1.0
   exit_rule: "opposite_band"
   warmup_days: 25
 
 risk:
-  strategy_daily_vol: 0.00625 # volatilitatea zilnica a strategiei la 1x, din backtest
-  target_daily_vol: 0.0075
-  contract_size: 2.0          # VERIFICA - valoarea unui punct de indice
-  lot_step: 0.01              # VERIFICA
-  min_lot: 0.01               # VERIFICA
+  strategy_daily_vol: 0.005816 # masurat pe excursion_opposite_band.csv (2 240 de zile), nu rotunjit
+  target_daily_vol: 0.0075    # folosit DOAR cand sizing.mode = "fixed"
+  contract_size: 2.0          # VERIFICA - confruntat cu symbol_info() la pornire
+  lot_step: 0.01              # VERIFICA - idem
+  min_lot: 0.01               # VERIFICA - idem
+
+sizing:
+  mode: "policy"              # "policy" = tabelul HJB | "fixed" = risk.target_daily_vol
+  policy_csv: "configs/live/sizing_policy_126d.csv"
+  horizon_days: 126           # orizontul pe care a fost rezolvat tabelul
+  phase: 1                    # 1 = evaluare (tinta +10%), 2 = verificare (tinta +5%)
+  phase1_target_pct: 0.10
+  phase2_target_pct: 0.05
 
 guards:
-  max_daily_loss_pct: 0.03    # limita FTMO e 5% - stam sub ea
-  max_total_loss_pct: 0.07    # limita FTMO e 10%
+  # ATENTIE, schimbare deliberata din 2026-10-12.
+  # Tabelul de marime a fost rezolvat presupunand EXACT limitele firmei (5% zilnic, 10% total)
+  # si tratand atingerea lor ca pierdere de cont, platita si inclusa in valoarea asteptata.
+  # O garda proprie mai stransa ar opri botul inainte ca politica sa apuce sa faca ce a fost
+  # calculata sa faca. Masurat pe 2 240 de zile, la 2.50%/zi: 10.8% din zile ating -3%,
+  # 4.96% ating -5%. Prima cifra ar fi insemnat 27 de zile oprite pe an degeaba.
+  # Daca vrei sa te intorci la varianta prudenta: 0.03 / 0.07.
+  max_daily_loss_pct: 0.05    # limita FTMO
+  max_total_loss_pct: 0.10    # limita FTMO
   max_orders_per_day: 20
-  max_lots: 3.0
+  max_lots: 20.0              # plafon absolut, nu plafon de risc
+  max_notional_mult: 5.0      # DISJUNCTOR: notional <= 5 x echitate. Politica cere maxim 4.30.
   halt_file: "HALT"
 
 news:
