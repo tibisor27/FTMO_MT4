@@ -386,7 +386,13 @@ class MT5Broker:
                 if abs(got - want) > 1e-9:
                     log.warning("EXECUTIE PARTIALA: cerut %.2f, executat %.2f (retcode %d) - "
                                 "pozitia ramane mai mica decat a cerut politica", want, got, rc)
-                return Fill(pd.Timestamp.now(tz="UTC"), side, got, float(res.price),
+                # res.price == 0.0 for market orders in MT5 — the real fill price is in deal history
+                fill_price = req["price"]   # fallback: bid/ask at order time (always better than 0)
+                if res.deal:
+                    deals = self.mt5.history_deals_get(ticket=res.deal)
+                    if deals:
+                        fill_price = float(deals[0].price)
+                return Fill(pd.Timestamp.now(tz="UTC"), side, got, fill_price,
                             "entry" if reduce_ticket is None else "exit", comment, requested=want)
             fatal = rc not in RETRY_CODES
             last = OrderRejected(f"ordin respins: {rc} {RETCODE_NAMES.get(rc, '?')} "
