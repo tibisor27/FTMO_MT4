@@ -192,6 +192,19 @@ RETCODE_NAMES = {10004: "REQUOTE", 10006: "REJECT", 10009: "DONE", 10010: "DONE_
                  10021: "PRICE_OFF", 10024: "TOO_MANY_REQUESTS", 10026: "SERVER_DISABLES_AT",
                  10027: "CLIENT_DISABLES_AT", 10031: "CONNECTION"}
 
+def server_to_utc(time_s, tz: str, plus_h: int) -> pd.DatetimeIndex:
+    """
+    Epoca serverului MT5 -> UTC, bara cu bara.
+
+    Serverul FTMO tine ora New York + 7h (17:00 NY = miezul noptii pe server), deci isi muta
+    ceasul odata cu SUA, nu cu Europa. Ora serverului minus 7h e ora din New York, iar fusul
+    stie singur daca in ziua barei era vara (UTC-4) sau iarna (UTC-5).
+    Verificat 2026-11-05: cu un singur +2h, zilele 26-30 oct aveau volumul maxim la 10:30 NY.
+    """
+    wall = pd.to_datetime(pd.Series(time_s).astype("int64"), unit="s") - pd.Timedelta(hours=plus_h)
+    local = wall.dt.tz_localize(tz, ambiguous="NaT", nonexistent="NaT")   # ora dubla/lipsa: duminica, piata e inchisa
+    return pd.DatetimeIndex(local.dt.tz_convert("UTC"), name="ts")
+
 
 class MT5Broker:
     """
@@ -204,8 +217,9 @@ class MT5Broker:
 
     def __init__(self, login: int | None = None, password: str | None = None,
                  server: str | None = None, magic: int = 20260913, deviation: int = 20,
-                 filling: str = "IOC"):
+                filling: str = "IOC", server_tz: str = "America/New_York", server_plus_h: int = 7):
         self.login, self.password, self.server = login, password, server
+        self.server_tz, self.server_plus_h = server_tz, server_plus_h   # regula ceasului serverului
         self.magic, self.deviation, self.filling = magic, deviation, filling
         self._mt5 = None
         self.server_utc_offset_s: int | None = None   # masurat la connect(), NU ghicit
@@ -275,10 +289,23 @@ class MT5Broker:
             raise RuntimeError(
                 f"decalajul serverului nu se confirma: tick spune {a/3600:+.2f}h, "
                 f"volumul spune {b/3600:+.2f}h. NU pornesc pe un fus orar nesigur.")
+        rule = self.rule_offset_s()
+        if a != rule:
+            raise RuntimeError(
+                f"regula ceasului ({self.server_tz} {self.server_plus_h:+d}h) da {rule/3600:+.2f}h, "
+                f"dar serverul arata {a/3600:+.2f}h. Brokerul nu foloseste regula asta - "
+                "corecteaz-o inainte de pornire, altfel istoricul iese mutat.")
         self.server_utc_offset_s = a
+
         log.info("decalaj server->UTC: %+.2f h (tick) / %s (volum)", a / 3600,
                  f"{b/3600:+.2f} h" if b is not None else "nemasurat")
         return a
+
+    def rule_offset_s(self) -> int:
+        """Decalajul server->UTC pe care il da regula ACUM: +2h iarna, +3h vara la FTMO."""
+        now = pd.Timestamp.now(tz=self.server_tz)
+        return int(now.utcoffset().total_seconds()) + self.server_plus_h * 3600
+
 
     def symbol_spec(self, symbol: str) -> SymbolSpec:
         """Specificatia reala, din terminal. Singura sursa de adevar pentru marimea contractului."""
@@ -315,10 +342,12 @@ class MT5Broker:
             raise RuntimeError("decalajul serverului nu a fost masurat - cheama "
                                "measure_server_offset() inainte de prima citire de bare")
         d = pd.DataFrame(r)
-        # MT5 stampileaza barele in ora SERVERULUI, ca epoca unix. Scadem decalajul masurat
-        # la conectare si abia apoi etichetam UTC. Conversia se face o singura data, aici.
-        d.index = pd.to_datetime(d["time"].astype("int64") - int(self.server_utc_offset_s),
-                                 unit="s", utc=True)
+        # MT5 stampileaza barele in ora SERVERULUI, ca epoca unix. Un decalaj fix e corect doar
+        # de la ultima schimbare de ora incoace, iar incalzirea are 25 de zile. Deci convertim
+        # bara cu bara, dupa regula ceasului serverului. Conversia se face o singura data, aici.
+        d.index = server_to_utc(d["time"], self.server_tz, self.server_plus_h)
+        d = d[d.index.notna()]
+
         d = d.rename(columns={"tick_volume": "volume"})
         keep = [c for c in ("open", "high", "low", "close", "volume") if c in d.columns]
         return d[keep].astype(float)

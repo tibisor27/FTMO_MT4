@@ -25,14 +25,15 @@ sys.path.insert(0, str(ROOT))
 
 from src.live.broker import MT5Broker, PaperBroker   # noqa: E402
 from src.live.runner import Runner, load_config      # noqa: E402
+from src.logging_config import setup_log  # noqa: E402
 
-
-def setup_log(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fmt = "%(asctime)s %(levelname)-7s %(name)-14s %(message)s"
-    logging.basicConfig(level=logging.INFO, format=fmt,
-                        handlers=[logging.StreamHandler(sys.stdout),
-                                  logging.FileHandler(path, encoding="utf-8")])
+#am creat configuratie de logging izolata pt intreg proeictul nu doar aici
+# def setup_log(path: Path) -> None:
+#     path.parent.mkdir(parents=True, exist_ok=True)
+#     fmt = "%(asctime)s %(levelname)-7s %(name)-14s %(message)s"
+#     logging.basicConfig(level=logging.INFO, format=fmt,
+#                         handlers=[logging.StreamHandler(sys.stdout),
+#                                   logging.FileHandler(path, encoding="utf-8")])
 
 
 def main() -> None:

@@ -253,12 +253,26 @@ def _rates(n=5, start_epoch=1_700_000_000):
 
 
 # ---------------------------------------------------------------- 1. fusul orar
-def test_bars_subtract_the_measured_server_offset():
+def test_bars_follow_the_server_clock_across_the_dst_change():
+    # 16:30 pe server = 09:30 New York, si vara (30 oct, UTC-4), si iarna (2 nov, UTC-5)
+    arr = _rates(2)
+    arr["time"] = [int(pd.Timestamp("2026-10-30 16:30", tz="UTC").timestamp()),
+                   int(pd.Timestamp("2026-11-02 16:30", tz="UTC").timestamp())]
     b = MT5Broker()
-    b._mt5 = FakeMT5(rates=_rates())
-    b.server_utc_offset_s = 3 * 3600                      # serverul e pe GMT+3
-    d = b.bars("X", 5)
-    assert d.index[0] == pd.Timestamp(1_700_000_000 - 3 * 3600, unit="s", tz="UTC")
+    b._mt5 = FakeMT5(rates=arr)
+    b.server_utc_offset_s = 2 * 3600                      # masurat azi, iarna
+    d = b.bars("X", 2)
+    assert list(d.index) == [pd.Timestamp("2026-10-30 13:30", tz="UTC"),
+                             pd.Timestamp("2026-11-02 14:30", tz="UTC")]
+
+
+def test_measure_server_offset_raises_when_the_server_does_not_follow_the_rule():
+    import time as _t
+    b = MT5Broker()
+    wrong = b.rule_offset_s() + 3600                      # serverul arata cu o ora mai mult
+    b._mt5 = FakeMT5(rates=_rates(10), tick_time=_t.time() + wrong)
+    with pytest.raises(RuntimeError, match="regula ceasului"):
+        b.measure_server_offset("X")
 
 
 def test_bars_refuse_to_run_before_the_offset_is_measured():
@@ -273,17 +287,18 @@ def test_measure_server_offset_raises_when_the_two_methods_disagree():
     import numpy as _np
     # tick-ul spune +3h; volumul e plat, dar il facem sa arate un alt minut aglomerat
     n = 3000
-    arr = _rates(n, int(_t.time()) + 3 * 3600 - 60 * n)
+    b = MT5Broker()
+    rule = b.rule_offset_s()                              # +2h iarna, +3h vara
+    arr = _rates(n, int(_t.time()) + rule - 60 * n)
     arr["tick_volume"] = 1
     arr["tick_volume"][::390] = 10_000                    # un minut aglomerat arbitrar
-    b = MT5Broker()
-    b._mt5 = FakeMT5(rates=arr, tick_time=_t.time() + 3 * 3600)
+    b._mt5 = FakeMT5(rates=arr, tick_time=_t.time() + rule)
     try:
         off = b.measure_server_offset("X")
     except RuntimeError as e:
         assert "nu se confirma" in str(e)
     else:
-        assert off == 3 * 3600                            # cele doua metode au cazut de acord
+        assert off == rule                                # cele doua metode au cazut de acord
 
 
 # ---------------------------------------------------------------- 2. retcode-uri

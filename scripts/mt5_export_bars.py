@@ -21,6 +21,12 @@ import time
 import pandas as pd
 
 
+# FTMO tine ceasul serverului la ora New York + 7h, deci isi muta ora odata cu SUA.
+# Aceeasi regula ca MT5Broker.bars() din src/live/broker.py; daca o schimbi, schimb-o in ambele.
+SERVER_TZ, SERVER_PLUS_H = "America/New_York", 7
+
+
+
 def server_offset_seconds(mt5, symbol: str, rth_start_utc_check: bool = True) -> int:
     """
     Decalajul ceasului serverului fata de UTC, in secunde, masurat in doua feluri independente.
@@ -71,12 +77,22 @@ def main() -> int:
         raise SystemExit(f"MT5 initialize a esuat: {mt5.last_error()}")
     try:
         off = server_offset_seconds(mt5, a.symbol)
+        rule = int(pd.Timestamp.now(tz=SERVER_TZ).utcoffset().total_seconds()) + SERVER_PLUS_H * 3600
+        if off != rule:
+            raise SystemExit(
+                f"regula ceasului ({SERVER_TZ} {SERVER_PLUS_H:+d}h) da {rule/3600:+.2f}h, dar serverul "
+                f"arata {off/3600:+.2f}h. NU scriu un fisier pe un fus orar gresit.")
+
         count = int(a.days) * 1440
         r = mt5.copy_rates_from_pos(a.symbol, mt5.TIMEFRAME_M1, 0, count)
         if r is None or len(r) == 0:
             raise SystemExit(f"fara bare pentru {a.symbol}: {mt5.last_error()}")
         d = pd.DataFrame(r)
-        d.index = pd.to_datetime(d["time"].astype("int64") - off, unit="s", utc=True)
+        # bara cu bara, dupa regula: un decalaj fix muta cu o ora zilele de dinainte de schimbarea orei
+        wall = pd.to_datetime(d["time"].astype("int64"), unit="s") - pd.Timedelta(hours=SERVER_PLUS_H)
+        d.index = pd.DatetimeIndex(wall.dt.tz_localize(SERVER_TZ, ambiguous="NaT", nonexistent="NaT")
+                                   .dt.tz_convert("UTC"))
+        d = d[d.index.notna()]
         d.index.name = "ts"
         d = d.rename(columns={"tick_volume": "volume"})
         keep = [c for c in ("open", "high", "low", "close", "volume") if c in d.columns]

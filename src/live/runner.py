@@ -236,26 +236,30 @@ class Runner:
 
     # ---------------- logging of intent, not just of orders ----------------
     def _record(self, d: Decision, lots: float, note: str, ctx: dict | None = None) -> None:
+        import csv
         ctx = ctx or {}
         p = self.root / self.cfg["paths"]["decisions"]
         p.parent.mkdir(parents=True, exist_ok=True)
         new = (not p.exists()) or p.stat().st_size == 0   # an existing but EMPTY file still needs a header
-        with p.open("a", encoding="utf-8") as f:
+        with p.open("a", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
             if new:
-                f.write("bar,close,ub,lb,current,target,lots,vol_target_pct,phase,"
-                        "days_left,eq_rel,reason,note\n")
-            f.write(f"{d.bar},{d.close},{d.ub},{d.lb},{d.current},{d.target},{lots},"
-                    f"{ctx.get('vol_pct','')},{ctx.get('phase','')},{ctx.get('days_left','')},"
-                    f"{ctx.get('eq_rel','')},{d.reason},{note}\n")
+                w.writerow(["bar", "close", "ub", "lb", "current", "target", "lots",
+                            "vol_target_pct", "phase", "days_left", "eq_rel", "reason", "note"])
+            w.writerow([d.bar, d.close, d.ub, d.lb, d.current, d.target, lots,
+                        ctx.get("vol_pct", ""), ctx.get("phase", ""), ctx.get("days_left", ""),
+                        ctx.get("eq_rel", ""), d.reason, note])
 
     def _record_fill(self, fill) -> None:
+        import csv
         p = self.root / self.cfg["paths"]["fills"]
         p.parent.mkdir(parents=True, exist_ok=True)
         new = (not p.exists()) or p.stat().st_size == 0
-        with p.open("a", encoding="utf-8") as f:
+        with p.open("a", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
             if new:
-                f.write("ts,side,lots,price,kind,comment\n")
-            f.write(f"{fill.ts},{fill.side},{fill.lots},{fill.price},{fill.kind},{fill.comment}\n")
+                w.writerow(["ts", "side", "lots", "price", "kind", "comment"])
+            w.writerow([fill.ts, fill.side, fill.lots, fill.price, fill.kind, fill.comment])
 
     def _sync(self) -> Position:
         pos = self.broker.position(self.symbol)

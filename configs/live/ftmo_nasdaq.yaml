@@ -17,16 +17,16 @@ session:
   act_offset_min: 1           # actionezi la HH:01, pe bara HH:00 tocmai incheiata
   max_conn_fails: 6           # treziri la rand fara terminal (6 x 5s = 30s) inainte de oprire
 
-strategy:                     # IDENTICE cu configs/events/noise_area.yaml
+strategy:                     # backtestul live: results/backtest/noise_area_USATECHIDXUSD_1m (manifest.json)
   lookback: 14
-  vm: 1.0                     # era 1.5; cercetarea, HJB-ul si politica de marime sunt toate pe 1.0
+  vm: 1.5                     # = manifest-ul de mai sus; strategy_daily_vol si politica HJB sunt masurate pe el
   exit_rule: "opposite_band"
   warmup_days: 25
 
 risk:
   strategy_daily_vol: 0.005816 # masurat pe excursion_opposite_band.csv (2 240 de zile), nu rotunjit
   target_daily_vol: 0.0075    # folosit DOAR cand sizing.mode = "fixed"
-  contract_size: 2.0          # VERIFICA - confruntat cu symbol_info() la pornire
+  contract_size: 1.0          # VERIFICA - confruntat cu symbol_info() la pornire
   lot_step: 0.01              # VERIFICA - idem
   min_lot: 0.01               # VERIFICA - idem
 

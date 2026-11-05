@@ -47,6 +47,7 @@ def replay(bars: pd.DataFrame, cfg: dict, day: str) -> pd.DataFrame:
                          act_offset_min=int(s.get("act_offset_min", 1)))
     loc = bars.index.tz_convert(clock.tz)
     same_day = (pd.Series(loc.date, index=bars.index) == pd.Timestamp(day).date()).to_numpy()
+    
     # RTH only: the CFD prints around the clock, but the strategy only exists inside the session
     in_rth = np.array([clock.in_session(t) for t in bars.index])
     todays = bars.index[same_day & in_rth]
@@ -71,7 +72,7 @@ def compare(expected: pd.DataFrame, decisions_csv: str | Path, day: str) -> list
     p = Path(decisions_csv)
     if not p.exists():
         return [Diff(pd.NaT, "missing", 0, 0, f"fara jurnal de decizii la {p}")]
-    live = pd.read_csv(p)
+    live = pd.read_csv(p, on_bad_lines="warn")   # 'warn' skips corrupt rows (comma in note) instead of crashing
     live["bar"] = pd.to_datetime(live["bar"], utc=True)
     live = live[live["bar"].dt.tz_convert("America/New_York").dt.date == pd.Timestamp(day).date()]
     out: list[Diff] = []
